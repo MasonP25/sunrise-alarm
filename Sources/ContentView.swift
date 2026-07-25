@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @State private var ble = BluetoothManager()
@@ -139,20 +140,23 @@ struct ContentView: View {
                     .padding()
                     .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.10)))
 
-                    // Demo button
-                    Button {
-                        animator.run(
-                            palette: paletteStore.activePalette,
-                            durationSeconds: 12,
-                            ble: ble
-                        )
+                    // Demo button with duration menu
+                    Menu {
+                        Button("10 seconds") { runDemo(seconds: 10) }
+                        Button("30 seconds") { runDemo(seconds: 30) }
+                        Button("1 minute")   { runDemo(seconds: 60) }
+                        Button("2 minutes")  { runDemo(seconds: 120) }
+                        Button("5 minutes")  { runDemo(seconds: 300) }
+                        Button("Stop demo", role: .destructive) { animator.cancel() }
                     } label: {
                         HStack {
                             Image(systemName: "play.fill")
-                            Text("Demo (12 seconds)")
+                            Text("Demo")
+                            Spacer()
+                            Image(systemName: "chevron.up.chevron.down").font(.caption2)
                         }
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
+                        .padding(.vertical, 8)
                     }
                     .buttonStyle(.bordered)
                     .disabled(!hasConnectedPeer)
@@ -231,6 +235,14 @@ struct ContentView: View {
 
     private var hasConnectedPeer: Bool {
         ble.peers.contains { $0.isSelected && $0.isConnected }
+    }
+
+    private func runDemo(seconds: Double) {
+        animator.run(
+            palette: paletteStore.activePalette,
+            durationSeconds: seconds,
+            ble: ble
+        )
     }
 
     private func sampledPreviewColors() -> [Color] {
