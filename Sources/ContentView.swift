@@ -741,8 +741,6 @@ struct DevicesSheet: View {
 struct PaletteEditorView: View {
     @Bindable var store: PaletteStore
     @Environment(\.dismiss) var dismiss
-    @State private var editingIndex: Int? = nil
-    @State private var editingColor: Color = .white
     @State private var newPaletteName: String = ""
 
     var body: some View {
@@ -751,6 +749,12 @@ struct PaletteEditorView: View {
                 palettesSection
                 colorsSection
             }
+            .scrollContentBackground(.hidden)
+            .background(
+                LinearGradient(colors: [Color(.systemGray6), Color(.systemGray5)],
+                               startPoint: .top, endPoint: .bottom)
+                    .ignoresSafeArea()
+            )
             .navigationTitle("Palettes")
             .navigationBarTitleDisplayMode(.inline)
             .environment(\.editMode, .constant(.active))
@@ -758,12 +762,6 @@ struct PaletteEditorView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
                 }
-            }
-            .sheet(item: Binding(
-                get: { editingIndex.map { IndexWrapper(index: $0) } },
-                set: { editingIndex = $0?.index }
-            )) { wrap in
-                colorEditSheet(wrap)
             }
         }
     }
@@ -805,7 +803,7 @@ struct PaletteEditorView: View {
     private var colorsSection: some View {
         Section("Colors in \"\(store.activePalette.name)\" (up to 15)") {
             ForEach(Array(store.activePalette.colors.enumerated()), id: \.element.id) { idx, color in
-                colorRow(index: idx, color: color)
+                colorRow(index: idx, current: color)
             }
             .onDelete { indexSet in
                 var p = store.activePalette
@@ -831,46 +829,31 @@ struct PaletteEditorView: View {
         }
     }
 
-    private func colorRow(index idx: Int, color: PaletteColor) -> some View {
-        HStack {
-            RoundedRectangle(cornerRadius: 6)
-                .fill(color.swiftUIColor)
-                .frame(width: 44, height: 30)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.4)))
-            Text("Color \(idx + 1)").font(.subheadline)
-            Spacer()
-            Button("Edit") {
-                editingIndex = idx
-                editingColor = color.swiftUIColor
+    /// Row IS a ColorPicker — tapping the color area opens the full iOS picker
+    /// (Grid / Spectrum / Sliders tabs) directly, no intermediate step.
+    /// Every change saves live via the setter.
+    private func colorRow(index idx: Int, current: PaletteColor) -> some View {
+        ColorPicker(selection: Binding(
+            get: {
+                Color(red: Double(current.r) / 255,
+                      green: Double(current.g) / 255,
+                      blue: Double(current.b) / 255)
+            },
+            set: { newColor in
+                var p = store.activePalette
+                guard idx < p.colors.count else { return }
+                let ui = UIColor(newColor)
+                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+                ui.getRed(&r, green: &g, blue: &b, alpha: &a)
+                p.colors[idx].r = UInt8(max(0, min(255, (r * 255).rounded())))
+                p.colors[idx].g = UInt8(max(0, min(255, (g * 255).rounded())))
+                p.colors[idx].b = UInt8(max(0, min(255, (b * 255).rounded())))
+                store.update(p)
             }
-            .buttonStyle(.bordered)
+        ), supportsOpacity: false) {
+            Text("Color \(idx + 1)")
+                .font(.subheadline)
         }
-    }
-
-    private func colorEditSheet(_ wrap: IndexWrapper) -> some View {
-        // Native UIKit color picker: grid / spectrum / sliders tabs, shown immediately.
-        // Live-updates editingColor as user picks; saves + dismisses when they tap X.
-        FullColorPickerSheet(color: $editingColor) {
-            saveEditedColor(index: wrap.index)
-        }
-        .ignoresSafeArea()
-    }
-
-    private func saveEditedColor(index: Int) {
-        var p = store.activePalette
-        guard index < p.colors.count else { return }
-        let ui = UIColor(editingColor)
-        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-        ui.getRed(&r, green: &g, blue: &b, alpha: &a)
-        p.colors[index].r = UInt8(max(0, min(255, (r * 255).rounded())))
-        p.colors[index].g = UInt8(max(0, min(255, (g * 255).rounded())))
-        p.colors[index].b = UInt8(max(0, min(255, (b * 255).rounded())))
-        store.update(p)
-        editingIndex = nil
     }
 }
 
-private struct IndexWrapper: Identifiable {
-    let index: Int
-    var id: Int { index }
-}
