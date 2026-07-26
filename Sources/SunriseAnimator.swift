@@ -11,12 +11,10 @@ class SunriseAnimator {
 
     private var task: Task<Void, Never>? = nil
 
-    func run(palette: Palette, durationSeconds: Double, ble: BluetoothManager) {
+    func run(palette: Palette, durationSeconds: Double, ble: BluetoothManager, reversed: Bool = false) {
         cancel()
         isRunning = true
         progress = 0
-        // Turn strip on before we start setting colors (some ELK-BLEDOM strips ignore
-        // color commands when in "off" state).
         ble.setPower(true)
 
         let start = Date()
@@ -26,7 +24,8 @@ class SunriseAnimator {
                 let now = Date()
                 let elapsed = now.timeIntervalSince(start)
                 let f = min(1.0, elapsed / durationSeconds)
-                let (r, g, b) = PaletteInterp.color(at: f, palette: palette)
+                let effective = reversed ? (1.0 - f) : f
+                let (r, g, b) = PaletteInterp.color(at: effective, palette: palette)
                 await MainActor.run {
                     self.progress = f
                     self.currentColor = (r, g, b)
@@ -37,9 +36,13 @@ class SunriseAnimator {
                         self.isRunning = false
                         self.progress = 1
                     }
+                    // Sunset ends at "dark" — turn strip off cleanly
+                    if reversed {
+                        ble.setPower(false)
+                    }
                     return
                 }
-                try? await Task.sleep(nanoseconds: 500_000_000)  // 0.5s
+                try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }
     }

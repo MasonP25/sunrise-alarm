@@ -7,8 +7,17 @@ struct ContentView: View {
     @State private var animator = SunriseAnimator()
     @State private var alarm = AlarmController()
     @State private var keepAlive = BackgroundKeepAlive()
+    @State private var ambient = AmbientSoundPlayer()
 
     @State private var showingPaletteEditor = false
+
+    // Sunset settings (persisted)
+    @State private var sunsetMinutes: Int = UserDefaults.standard.integer(forKey: "sunset_minutes") == 0 ? 30 : UserDefaults.standard.integer(forKey: "sunset_minutes")
+
+    // Ambient sound settings
+    @State private var soundEnabled: Bool = UserDefaults.standard.bool(forKey: "sound_enabled")
+    @State private var soundType: AmbientSoundType = AmbientSoundType(rawValue: UserDefaults.standard.string(forKey: "sound_type") ?? "") ?? .brownNoise
+    @State private var soundFadeMinutes: Int = UserDefaults.standard.integer(forKey: "sound_fade") == 0 ? 10 : UserDefaults.standard.integer(forKey: "sound_fade")
 
     private var hasConnectedPeer: Bool {
         ble.peers.contains { $0.isSelected && $0.isConnected }
@@ -21,6 +30,8 @@ struct ContentView: View {
                     statusText
                     previewSwatch
                     alarmCard
+                    sunsetCard
+                    soundCard
                     demoButton
                     manualControls
                     devicesCard
@@ -35,7 +46,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Subviews
+    // MARK: - Status + preview
 
     private var statusText: some View {
         Text(ble.status)
@@ -53,7 +64,7 @@ struct ContentView: View {
             .frame(height: 60)
             .overlay(alignment: .leading) {
                 if animator.isRunning {
-                    Text("Sunrise \(Int(animator.progress * 100))%")
+                    Text("\(Int(animator.progress * 100))%")
                         .font(.system(.footnote, design: .monospaced))
                         .foregroundStyle(.white)
                         .shadow(radius: 2)
@@ -62,18 +73,17 @@ struct ContentView: View {
             }
     }
 
+    // MARK: - Alarm
+
     private var alarmCard: some View {
         VStack(spacing: 12) {
             wakeTimePicker
             durationRow
             paletteRow
             palettePreviewStrip
+            repeatDaysChips
             armButton
-            if alarm.isArmed {
-                Text("Keep the phone plugged in overnight. App runs in background.")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
+            snoozeButton
         }
         .padding()
         .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.10)))
@@ -130,9 +140,7 @@ struct ContentView: View {
                 }
             }
             .pickerStyle(.menu)
-            Button {
-                showingPaletteEditor = true
-            } label: {
+            Button { showingPaletteEditor = true } label: {
                 Image(systemName: "pencil")
             }
         }
@@ -148,12 +156,42 @@ struct ContentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
+    private var repeatDaysChips: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Repeat")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 6) {
+                ForEach(1...7, id: \.self) { day in
+                    dayChip(day)
+                }
+            }
+        }
+    }
+
+    private func dayChip(_ day: Int) -> some View {
+        let selected = alarm.repeatDays.contains(day)
+        let label = ["S", "M", "T", "W", "T", "F", "S"][day - 1]
+        return Button {
+            if selected { alarm.repeatDays.remove(day) }
+            else { alarm.repeatDays.insert(day) }
+        } label: {
+            Text(label)
+                .font(.system(.footnote, design: .rounded)).bold()
+                .frame(width: 32, height: 32)
+                .background(Circle().fill(selected ? Color.orange : Color.gray.opacity(0.2)))
+                .foregroundStyle(selected ? .white : .primary)
+        }
+        .buttonStyle(.plain)
+    }
+
     private var armButton: some View {
         Button {
             toggleAlarm()
         } label: {
             Text(alarm.isArmed
-                 ? "Disarm — fires at \(nextFireString())"
+                 ? "Disarm — fires \(nextFireString())"
                  : "Arm Alarm")
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 6)
@@ -162,6 +200,122 @@ struct ContentView: View {
         .tint(alarm.isArmed ? .red : .orange)
     }
 
+    @ViewBuilder
+    private var snoozeButton: some View {
+        if animator.isRunning {
+            Button {
+                snoozeCurrent()
+            } label: {
+                HStack {
+                    Image(systemName: "zzz")
+                    Text("Snooze 10 min")
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+            }
+            .buttonStyle(.bordered)
+            .tint(.blue)
+        }
+    }
+
+    // MARK: - Sunset
+
+    private var sunsetCard: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Text("Sunset (fade to sleep)")
+                    .font(.headline)
+                Spacer()
+                Picker("Length", selection: Binding(
+                    get: { sunsetMinutes },
+                    set: {
+                        sunsetMinutes = $0
+                        UserDefaults.standard.set($0, forKey: "sunset_minutes")
+                    })) {
+                    ForEach([5, 10, 15, 20, 30, 45, 60], id: \.self) { Text("\($0) min").tag($0) }
+                }
+                .pickerStyle(.menu)
+            }
+            Button {
+                startSunset()
+            } label: {
+                HStack {
+                    Image(systemName: "moon.fill")
+                    Text("Start Sunset")
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.purple)
+            .disabled(!hasConnectedPeer)
+        }
+        .padding()
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.10)))
+    }
+
+    // MARK: - Ambient sound
+
+    private var soundCard: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Text("Ambient Sound").font(.headline)
+                Spacer()
+                Toggle("", isOn: $soundEnabled)
+                    .labelsHidden()
+                    .onChange(of: soundEnabled) { _, v in
+                        UserDefaults.standard.set(v, forKey: "sound_enabled")
+                        if !v { ambient.stop() }
+                    }
+            }
+            HStack {
+                Text("Type")
+                Spacer()
+                Picker("Type", selection: Binding(
+                    get: { soundType },
+                    set: {
+                        soundType = $0
+                        UserDefaults.standard.set($0.rawValue, forKey: "sound_type")
+                    })) {
+                    ForEach(AmbientSoundType.allCases) { t in
+                        Text(t.rawValue).tag(t)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+            HStack {
+                Text("Fade in over")
+                Spacer()
+                Picker("Fade", selection: Binding(
+                    get: { soundFadeMinutes },
+                    set: {
+                        soundFadeMinutes = $0
+                        UserDefaults.standard.set($0, forKey: "sound_fade")
+                    })) {
+                    ForEach([1, 3, 5, 10, 15, 20, 30], id: \.self) { Text("\($0) min").tag($0) }
+                }
+                .pickerStyle(.menu)
+            }
+            Button {
+                if ambient.isPlaying { ambient.stop() }
+                else { ambient.start(type: soundType, fadeInMinutes: Double(soundFadeMinutes)) }
+            } label: {
+                HStack {
+                    Image(systemName: ambient.isPlaying ? "stop.fill" : "play.fill")
+                    Text(ambient.isPlaying ? "Stop Sound" : "Play Sound")
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!soundEnabled)
+        }
+        .padding()
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.10)))
+    }
+
+    // MARK: - Demo + manual + devices
+
     private var demoButton: some View {
         Menu {
             Button("10 seconds") { runDemo(seconds: 10) }
@@ -169,23 +323,19 @@ struct ContentView: View {
             Button("1 minute")   { runDemo(seconds: 60) }
             Button("2 minutes")  { runDemo(seconds: 120) }
             Button("5 minutes")  { runDemo(seconds: 300) }
-            Button("Stop demo", role: .destructive) { animator.cancel() }
+            Button("Stop", role: .destructive) { animator.cancel() }
         } label: {
-            demoLabel
+            HStack {
+                Image(systemName: "play.fill")
+                Text("Demo Sunrise")
+                Spacer()
+                Image(systemName: "chevron.up.chevron.down").font(.caption2)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.4)))
         }
         .disabled(!hasConnectedPeer)
-    }
-
-    private var demoLabel: some View {
-        HStack {
-            Image(systemName: "play.fill")
-            Text("Demo")
-            Spacer()
-            Image(systemName: "chevron.up.chevron.down").font(.caption2)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 10)
-        .background(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.4)))
     }
 
     @ViewBuilder
@@ -224,7 +374,7 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
             }
             if ble.peers.isEmpty {
-                Text("Tap Scan to find your ELK-BLEDOM strips.")
+                Text("Tap Scan to find your LED strips.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -260,23 +410,40 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - Actions / helpers
+    // MARK: - Actions
 
     private func toggleAlarm() {
         if alarm.isArmed {
             alarm.cancel()
             keepAlive.stop()
         } else {
-            alarm.arm {
-                let seconds = Double(alarm.durationMinutes) * 60
-                animator.run(
-                    palette: paletteStore.activePalette,
-                    durationSeconds: seconds,
-                    ble: ble
-                )
-            }
+            alarm.arm { fireSunrise() }
             keepAlive.start()
         }
+    }
+
+    private func fireSunrise() {
+        let seconds = Double(alarm.durationMinutes) * 60
+        animator.run(
+            palette: paletteStore.activePalette,
+            durationSeconds: seconds,
+            ble: ble
+        )
+    }
+
+    private func snoozeCurrent() {
+        animator.cancel()
+        alarm.snooze(minutes: 10) { fireSunrise() }
+    }
+
+    private func startSunset() {
+        animator.run(
+            palette: paletteStore.activePalette,
+            durationSeconds: Double(sunsetMinutes) * 60,
+            ble: ble,
+            reversed: true
+        )
+        keepAlive.start()  // stay awake for the fade
     }
 
     private func runDemo(seconds: Double) {
@@ -298,12 +465,17 @@ struct ContentView: View {
     private func nextFireString() -> String {
         guard let d = alarm.nextFireDate else { return "?" }
         let df = DateFormatter()
-        df.dateFormat = "h:mm a"
+        let cal = Calendar.current
+        if cal.isDateInToday(d) || cal.isDateInTomorrow(d) {
+            df.dateFormat = "EEE h:mm a"
+        } else {
+            df.dateFormat = "EEE MMM d, h:mm a"
+        }
         return df.string(from: d)
     }
 }
 
-// MARK: - Palette Editor
+// MARK: - Palette Editor (supports 10+ colors)
 
 struct PaletteEditorView: View {
     @Bindable var store: PaletteStore
@@ -369,13 +541,11 @@ struct PaletteEditorView: View {
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture {
-            store.setActive(p)
-        }
+        .onTapGesture { store.setActive(p) }
     }
 
     private var colorsSection: some View {
-        Section("Colors in \"\(store.activePalette.name)\"") {
+        Section("Colors in \"\(store.activePalette.name)\" (up to 15)") {
             ForEach(Array(store.activePalette.colors.enumerated()), id: \.element.id) { idx, color in
                 colorRow(index: idx, color: color)
             }
@@ -392,12 +562,14 @@ struct PaletteEditorView: View {
                 store.update(p)
             }
 
-            Button {
-                var p = store.activePalette
-                p.colors.append(.warmWht)
-                store.update(p)
-            } label: {
-                Label("Add color", systemImage: "plus.circle")
+            if store.activePalette.colors.count < 15 {
+                Button {
+                    var p = store.activePalette
+                    p.colors.append(.warmWht)
+                    store.update(p)
+                } label: {
+                    Label("Add color", systemImage: "plus.circle")
+                }
             }
         }
     }
@@ -432,9 +604,7 @@ struct PaletteEditorView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Save") {
-                        saveEditedColor(index: wrap.index)
-                    }
+                    Button("Save") { saveEditedColor(index: wrap.index) }
                 }
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Cancel") { editingIndex = nil }
