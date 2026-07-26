@@ -14,6 +14,11 @@ struct AlarmEditView: View {
     @State private var paletteID: UUID? = nil
     @State private var repeatDays: Set<Int> = []
 
+    // Sound
+    @State private var soundEnabled: Bool = false
+    @State private var soundType: AmbientSoundType = .brownNoise
+    @State private var soundMinutesBefore: Int = 15
+
     init(paletteStore: PaletteStore,
          existing: AlarmProfile?,
          onSave: @escaping (AlarmProfile) -> Void,
@@ -50,9 +55,7 @@ struct AlarmEditView: View {
 
                 Section("Repeat") {
                     HStack(spacing: 8) {
-                        ForEach(1...7, id: \.self) { d in
-                            dayChip(d)
-                        }
+                        ForEach(1...7, id: \.self) { dayChip($0) }
                     }
                     Text(repeatDays.isEmpty
                          ? "Fires once, then disables itself"
@@ -74,6 +77,27 @@ struct AlarmEditView: View {
                             Text(p.name).tag(p.id)
                         }
                     }
+                }
+
+                Section {
+                    Toggle("Play ambient sound before wake", isOn: $soundEnabled)
+                    if soundEnabled {
+                        Picker("Sound", selection: $soundType) {
+                            ForEach(AmbientSoundType.allCases) { t in
+                                Text(t.rawValue).tag(t)
+                            }
+                        }
+                        Picker("Start", selection: $soundMinutesBefore) {
+                            ForEach([5, 10, 15, 20, 30, 45, 60], id: \.self) { m in
+                                Text("\(m) min before").tag(m)
+                            }
+                        }
+                        Text("Sound starts quietly \(soundMinutesBefore) min before wake and reaches max volume exactly at wake time.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Ambient Sound")
                 }
 
                 if let onDelete = onDelete {
@@ -100,7 +124,10 @@ struct AlarmEditView: View {
                             durationMinutes: durationMinutes,
                             paletteID: paletteID,
                             repeatDays: repeatDays,
-                            isEnabled: existing?.isEnabled ?? true
+                            isEnabled: existing?.isEnabled ?? true,
+                            soundEnabled: soundEnabled,
+                            soundType: soundType,
+                            soundMinutesBefore: soundMinutesBefore
                         )
                         onSave(profile)
                         dismiss()
@@ -115,6 +142,9 @@ struct AlarmEditView: View {
                     durationMinutes = e.durationMinutes
                     paletteID = e.paletteID ?? paletteStore.palettes.first?.id
                     repeatDays = e.repeatDays
+                    soundEnabled = e.soundEnabled
+                    soundType = e.soundType
+                    soundMinutesBefore = e.soundMinutesBefore
                 } else {
                     paletteID = paletteStore.palettes.first?.id
                 }

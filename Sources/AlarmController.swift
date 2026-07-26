@@ -8,8 +8,13 @@ struct AlarmProfile: Identifiable, Codable, Equatable {
     var minute: Int
     var durationMinutes: Int
     var paletteID: UUID?
-    var repeatDays: Set<Int>   // 1=Sun..7=Sat, empty = one-shot
+    var repeatDays: Set<Int>
     var isEnabled: Bool
+
+    // Ambient sound settings (per-alarm)
+    var soundEnabled: Bool
+    var soundType: AmbientSoundType
+    var soundMinutesBefore: Int   // how many min before wake to start ramping in
 
     init(id: UUID = UUID(),
          name: String,
@@ -17,7 +22,10 @@ struct AlarmProfile: Identifiable, Codable, Equatable {
          durationMinutes: Int = 20,
          paletteID: UUID? = nil,
          repeatDays: Set<Int> = [],
-         isEnabled: Bool = false) {
+         isEnabled: Bool = false,
+         soundEnabled: Bool = false,
+         soundType: AmbientSoundType = .brownNoise,
+         soundMinutesBefore: Int = 15) {
         self.id = id
         self.name = name
         self.hour = hour
@@ -26,6 +34,29 @@ struct AlarmProfile: Identifiable, Codable, Equatable {
         self.paletteID = paletteID
         self.repeatDays = repeatDays
         self.isEnabled = isEnabled
+        self.soundEnabled = soundEnabled
+        self.soundType = soundType
+        self.soundMinutesBefore = soundMinutesBefore
+    }
+
+    // Custom Codable: allow older stored alarms (without sound fields) to decode.
+    enum CodingKeys: String, CodingKey {
+        case id, name, hour, minute, durationMinutes, paletteID, repeatDays, isEnabled
+        case soundEnabled, soundType, soundMinutesBefore
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        hour = try c.decode(Int.self, forKey: .hour)
+        minute = try c.decode(Int.self, forKey: .minute)
+        durationMinutes = try c.decode(Int.self, forKey: .durationMinutes)
+        paletteID = try c.decodeIfPresent(UUID.self, forKey: .paletteID)
+        repeatDays = try c.decode(Set<Int>.self, forKey: .repeatDays)
+        isEnabled = try c.decode(Bool.self, forKey: .isEnabled)
+        soundEnabled = try c.decodeIfPresent(Bool.self, forKey: .soundEnabled) ?? false
+        soundType = try c.decodeIfPresent(AmbientSoundType.self, forKey: .soundType) ?? .brownNoise
+        soundMinutesBefore = try c.decodeIfPresent(Int.self, forKey: .soundMinutesBefore) ?? 15
     }
 }
 
@@ -33,25 +64,21 @@ struct AlarmProfile: Identifiable, Codable, Equatable {
 class AlarmController {
     private static let key = "alarms_v2"
     var alarms: [AlarmProfile] = []
-    /// Latest computed next-fire per enabled alarm, for display.
     var nextFires: [UUID: Date] = [:]
 
-    private var tasks: [UUID: Task<Void, Never>] = [:]
-    // Callback receives (profile, effectiveDurationSeconds).
-    // effectiveDuration is the profile's full duration when scheduled normally,
-    // or reduced if the app opened after the intended start time.
-    private var onFireHandler: ((AlarmProfile, TimeInterval) -> Void)? = nil
+    private var tasks: [UUID: [Task<Void, Never>]] = [:]
+    // Sunrise handler: (profile, effectiveDurationSeconds)
+    private var onSunriseFire: ((AlarmProfile, TimeInterval) -> Void)? = nil
+    // Sound handler: (profile) — reads soundType, soundMinutesBefore
+    private var onSoundFire:  ((AlarmProfile) -> Void)? = nil
 
     var hasEnabledAlarm: Bool { alarms.contains { $0.isEnabled } }
 
-    /// Soonest upcoming fire across all enabled alarms.
     var soonestNextFire: (alarm: AlarmProfile, date: Date)? {
         var best: (AlarmProfile, Date)? = nil
         for a in alarms where a.isEnabled {
             guard let d = nextFires[a.id] else { continue }
-            if best == nil || d < best!.1 {
-                best = (a, d)
-            }
+            if best == nil || d < best!.1 { best = (a, d) }
         }
         return best
     }
@@ -67,10 +94,10 @@ class AlarmController {
         }
     }
 
-    /// Wire up what to do when any alarm fires (called on main).
-    /// Handler receives (profile, effectiveDurationSeconds).
-    func setOnFire(_ handler: @escaping (AlarmProfile, TimeInterval) -> Void) {
-        onFireHandler = handler
+    func setOnFire(sunrise: @escaping (AlarmProfile, TimeInterval) -> Void,
+                   sound:   @escaping (AlarmProfile) -> Void) {
+        onSunriseFire = sunrise
+        onSoundFire = sound
         rescheduleAll()
     }
 
@@ -102,18 +129,16 @@ class AlarmController {
         if on { schedule(alarms[idx]) }
     }
 
-    /// Snooze a currently-firing alarm by N minutes. Runs a compressed 5-minute sunrise then.
     func snooze(alarmID: UUID, minutes: Int) {
         guard let a = alarms.first(where: { $0.id == alarmID }) else { return }
         cancel(id: alarmID)
         let fire = Date().addingTimeInterval(Double(minutes) * 60)
         nextFires[alarmID] = fire
-        tasks[alarmID] = Task { [weak self] in
+        let task = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Double(minutes) * 60 * 1_000_000_000))
             if Task.isCancelled { return }
             await MainActor.run {
-                // Snooze wake = punchy 5-min sunrise (they want to actually get up now).
-                self?.onFireHandler?(a, 5 * 60)
+                self?.onSunriseFire?(a, 5 * 60)  // 5 min mini-sunrise on snooze
                 if a.repeatDays.isEmpty {
                     self?.toggle(id: a.id, on: false)
                 } else {
@@ -121,6 +146,7 @@ class AlarmController {
                 }
             }
         }
+        tasks[alarmID] = [task]
     }
 
     // MARK: - Internals
@@ -133,38 +159,39 @@ class AlarmController {
     }
 
     private func schedule(_ alarm: AlarmProfile) {
-        guard onFireHandler != nil else { return }
+        guard onSunriseFire != nil else { return }
         guard let wakeTime = computeNextFire(for: alarm) else { return }
-        // Sunrise should PEAK at wake time — schedule the animation start
-        // durationMinutes BEFORE wake time so the final bright frame lands at wake.
-        nextFires[alarm.id] = wakeTime  // display: user's set wake time
-        let fullDuration = Double(alarm.durationMinutes) * 60
-        let startTime = wakeTime.addingTimeInterval(-fullDuration)
+        nextFires[alarm.id] = wakeTime
+
+        let fullSunrise = Double(alarm.durationMinutes) * 60
+        let sunriseStart = wakeTime.addingTimeInterval(-fullSunrise)
         let now = Date()
 
-        let delay: TimeInterval
+        let sunriseDelay: TimeInterval
         let effectiveDuration: TimeInterval
-        if startTime <= now && now < wakeTime {
-            // We're already inside the sunrise window (app opened late).
-            // Start immediately with reduced duration ending at wake time.
-            delay = 0
+        if sunriseStart <= now && now < wakeTime {
+            sunriseDelay = 0
             effectiveDuration = max(30, wakeTime.timeIntervalSince(now))
         } else if now >= wakeTime {
-            // Already past wake time (shouldn't happen for future wake but guard anyway).
-            // Just fire immediately with the full duration.
-            delay = 0
-            effectiveDuration = fullDuration
+            sunriseDelay = 0
+            effectiveDuration = fullSunrise
         } else {
-            delay = startTime.timeIntervalSince(now)
-            effectiveDuration = fullDuration
+            sunriseDelay = sunriseStart.timeIntervalSince(now)
+            effectiveDuration = fullSunrise
         }
 
-        tasks[alarm.id] = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        var alarmTasks: [Task<Void, Never>] = []
+
+        // Sunrise task
+        let sunriseTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(sunriseDelay * 1_000_000_000))
+            if Task.isCancelled { return }
+            await MainActor.run { self?.onSunriseFire?(alarm, effectiveDuration) }
+            // After the animation completes (+ small buffer), re-arm if repeating
+            try? await Task.sleep(nanoseconds: UInt64((effectiveDuration + 30) * 1_000_000_000))
             if Task.isCancelled { return }
             await MainActor.run {
                 guard let self = self else { return }
-                self.onFireHandler?(alarm, effectiveDuration)
                 if alarm.repeatDays.isEmpty {
                     self.toggle(id: alarm.id, on: false)
                 } else {
@@ -172,10 +199,34 @@ class AlarmController {
                 }
             }
         }
+        alarmTasks.append(sunriseTask)
+
+        // Sound task (if enabled)
+        if alarm.soundEnabled && alarm.soundMinutesBefore > 0 {
+            let soundStart = wakeTime.addingTimeInterval(-Double(alarm.soundMinutesBefore * 60))
+            let soundDelay: TimeInterval
+            if soundStart <= now && now < wakeTime {
+                soundDelay = 0
+            } else if now >= wakeTime {
+                soundDelay = -1  // skip; alarm already fired
+            } else {
+                soundDelay = soundStart.timeIntervalSince(now)
+            }
+            if soundDelay >= 0 {
+                let soundTask = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(soundDelay * 1_000_000_000))
+                    if Task.isCancelled { return }
+                    await MainActor.run { self?.onSoundFire?(alarm) }
+                }
+                alarmTasks.append(soundTask)
+            }
+        }
+
+        tasks[alarm.id] = alarmTasks
     }
 
     private func cancel(id: UUID) {
-        tasks[id]?.cancel()
+        tasks[id]?.forEach { $0.cancel() }
         tasks[id] = nil
         nextFires.removeValue(forKey: id)
     }

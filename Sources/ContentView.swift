@@ -97,9 +97,14 @@ struct ContentView: View {
                 )
             }
             .onAppear {
-                alarm.setOnFire { profile, duration in
-                    fireSunrise(for: profile, duration: duration)
-                }
+                alarm.setOnFire(
+                    sunrise: { profile, duration in
+                        fireSunrise(for: profile, duration: duration)
+                    },
+                    sound: { profile in
+                        fireSound(for: profile)
+                    }
+                )
                 syncKeepAlive()
             }
             .onReceive(uiTicker) { _ in
@@ -228,6 +233,11 @@ struct ContentView: View {
                             Text(daysString(a.repeatDays))
                                 .font(.footnote)
                                 .foregroundStyle(a.isEnabled ? Color.white.opacity(0.7) : Color.white.opacity(0.3))
+                            if a.soundEnabled {
+                                Image(systemName: "waveform")
+                                    .font(.caption2)
+                                    .foregroundStyle(a.isEnabled ? Color.teal.opacity(0.9) : Color.teal.opacity(0.3))
+                            }
                         }
                     }
                     Spacer()
@@ -539,6 +549,16 @@ struct ContentView: View {
             palette: palette,
             durationSeconds: duration,
             ble: ble
+        )
+    }
+
+    /// Called by AlarmController at (wakeTime - soundMinutesBefore).
+    /// Starts ambient sound that ramps from 0 to max over soundMinutesBefore minutes,
+    /// so it reaches full volume exactly at the wake time.
+    private func fireSound(for profile: AlarmProfile) {
+        ambient.start(
+            type: profile.soundType,
+            fadeInMinutes: Double(profile.soundMinutesBefore)
         )
     }
 
