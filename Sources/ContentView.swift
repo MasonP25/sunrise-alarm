@@ -37,6 +37,9 @@ struct ContentView: View {
                         alarmsCard
                         sunsetCard
                         soundCard
+                        if hasConnectedPeer {
+                            manualColorsCard
+                        }
                         Divider().padding(.horizontal, 40).opacity(0.4)
                         quickActionsRow
                         Spacer().frame(height: 20)
@@ -413,6 +416,48 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .disabled(!soundEnabled)
         }
+    }
+
+    // MARK: - Manual Colors
+
+    private var manualColorsCard: some View {
+        card(title: "Manual Colors", icon: "circle.grid.3x3.fill", accent: .orange, trailing: {
+            AnyView(EmptyView())
+        }) {
+            AnyView(
+                VStack(spacing: 10) {
+                    HStack(spacing: 10) {
+                        manualColorButton(name: "Red",    color: .red)    { ble.setColor(r: 255, g: 0,   b: 0)   }
+                        manualColorButton(name: "Green",  color: .green)  { ble.setColor(r: 0,   g: 255, b: 0)   }
+                        manualColorButton(name: "Blue",   color: .blue)   { ble.setColor(r: 0,   g: 0,   b: 255) }
+                    }
+                    HStack(spacing: 10) {
+                        manualColorButton(name: "Purple", color: .purple) { ble.setColor(r: 128, g: 0,   b: 128) }
+                        manualColorButton(name: "Orange", color: .orange) { ble.setColor(r: 255, g: 140, b: 0)   }
+                        manualColorButton(name: "White",  color: .white)  { ble.setColor(r: 255, g: 240, b: 220) }
+                    }
+                }
+            )
+        }
+    }
+
+    private func manualColorButton(name: String, color: Color, action: @escaping () -> Void) -> some View {
+        Button {
+            ble.setPower(true)
+            action()
+        } label: {
+            Text(name)
+                .fontWeight(.semibold)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(color)
+                        .shadow(color: color.opacity(0.4), radius: 8, y: 3)
+                )
+                .foregroundStyle(color == .white ? .black : .white)
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - Quick actions row (demo + on/off)
@@ -803,22 +848,12 @@ struct PaletteEditorView: View {
     }
 
     private func colorEditSheet(_ wrap: IndexWrapper) -> some View {
-        NavigationStack {
-            VStack {
-                ColorPicker("Color \(wrap.index + 1)", selection: $editingColor, supportsOpacity: false)
-                    .labelsHidden().scaleEffect(1.5).padding()
-                Spacer()
-            }
-            .navigationTitle("Edit Color").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Save") { saveEditedColor(index: wrap.index) }
-                }
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Cancel") { editingIndex = nil }
-                }
-            }
+        // Native UIKit color picker: grid / spectrum / sliders tabs, shown immediately.
+        // Live-updates editingColor as user picks; saves + dismisses when they tap X.
+        FullColorPickerSheet(color: $editingColor) {
+            saveEditedColor(index: wrap.index)
         }
+        .ignoresSafeArea()
     }
 
     private func saveEditedColor(index: Int) {
