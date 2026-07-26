@@ -1,133 +1,195 @@
 import Foundation
 import Observation
 
+struct AlarmProfile: Identifiable, Codable, Equatable {
+    let id: UUID
+    var name: String
+    var hour: Int
+    var minute: Int
+    var durationMinutes: Int
+    var paletteID: UUID?
+    var repeatDays: Set<Int>   // 1=Sun..7=Sat, empty = one-shot
+    var isEnabled: Bool
+
+    init(id: UUID = UUID(),
+         name: String,
+         hour: Int, minute: Int,
+         durationMinutes: Int = 20,
+         paletteID: UUID? = nil,
+         repeatDays: Set<Int> = [],
+         isEnabled: Bool = false) {
+        self.id = id
+        self.name = name
+        self.hour = hour
+        self.minute = minute
+        self.durationMinutes = durationMinutes
+        self.paletteID = paletteID
+        self.repeatDays = repeatDays
+        self.isEnabled = isEnabled
+    }
+}
+
 @Observable
 class AlarmController {
-    var isArmed: Bool = false
-    var nextFireDate: Date? = nil
+    private static let key = "alarms_v2"
+    var alarms: [AlarmProfile] = []
+    /// Latest computed next-fire per enabled alarm, for display.
+    var nextFires: [UUID: Date] = [:]
 
-    var alarmHour: Int {
-        didSet { UserDefaults.standard.set(alarmHour, forKey: "alarm_hour") }
-    }
-    var alarmMinute: Int {
-        didSet { UserDefaults.standard.set(alarmMinute, forKey: "alarm_minute") }
-    }
-    var durationMinutes: Int {
-        didSet { UserDefaults.standard.set(durationMinutes, forKey: "duration_minutes") }
-    }
-    /// Weekdays 1=Sun ... 7=Sat. Empty = one-shot (fires once, then disarms).
-    var repeatDays: Set<Int> {
-        didSet {
-            let arr = Array(repeatDays).sorted()
-            UserDefaults.standard.set(arr, forKey: "repeat_days")
-        }
-    }
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+    private var onFireHandler: ((AlarmProfile) -> Void)? = nil
 
-    private var task: Task<Void, Never>? = nil
-    private var currentOnFire: (() -> Void)? = nil  // saved for re-arm / snooze
+    var hasEnabledAlarm: Bool { alarms.contains { $0.isEnabled } }
 
-    init() {
-        alarmHour       = (UserDefaults.standard.object(forKey: "alarm_hour")       as? Int) ?? 7
-        alarmMinute     = (UserDefaults.standard.object(forKey: "alarm_minute")     as? Int) ?? 0
-        durationMinutes = (UserDefaults.standard.object(forKey: "duration_minutes") as? Int) ?? 20
-        repeatDays      = Set((UserDefaults.standard.array(forKey: "repeat_days") as? [Int]) ?? [])
-    }
-
-    /// Compute the next Date matching alarm time and (if set) repeat days.
-    func computeNextFire(now: Date = Date()) -> Date {
-        var comps = DateComponents()
-        comps.hour = alarmHour
-        comps.minute = alarmMinute
-        comps.second = 0
-
-        let cal = Calendar.current
-
-        if repeatDays.isEmpty {
-            // Single-fire: just next matching time
-            let next = cal.nextDate(after: now, matching: comps, matchingPolicy: .nextTime, direction: .forward)
-                ?? now.addingTimeInterval(60)
-            return next
-        }
-
-        // Repeat mode: find next date whose weekday is in repeatDays
-        for daysAhead in 0..<8 {
-            guard let candidate = cal.date(byAdding: .day, value: daysAhead, to: now) else { continue }
-            var c = cal.dateComponents([.year, .month, .day], from: candidate)
-            c.hour = alarmHour
-            c.minute = alarmMinute
-            c.second = 0
-            if let date = cal.date(from: c),
-               date > now,
-               repeatDays.contains(cal.component(.weekday, from: date)) {
-                return date
+    /// Soonest upcoming fire across all enabled alarms.
+    var soonestNextFire: (alarm: AlarmProfile, date: Date)? {
+        var best: (AlarmProfile, Date)? = nil
+        for a in alarms where a.isEnabled {
+            guard let d = nextFires[a.id] else { continue }
+            if best == nil || d < best!.1 {
+                best = (a, d)
             }
         }
-        return now.addingTimeInterval(24 * 3600)
+        return best
     }
 
-    /// Arm the alarm. onFire is called on main actor when time hits.
-    /// If repeatDays is non-empty, auto-rearms after firing.
-    func arm(onFire: @escaping () -> Void) {
-        cancel()
-        currentOnFire = onFire
-        scheduleNext()
+    init() {
+        load()
+        if alarms.isEmpty {
+            alarms = [
+                AlarmProfile(name: "Weekdays", hour: 6, minute: 30, repeatDays: [2,3,4,5,6]),
+                AlarmProfile(name: "Weekends", hour: 8, minute: 0, repeatDays: [1,7]),
+            ]
+            save()
+        }
     }
 
-    private func scheduleNext() {
-        guard let onFire = currentOnFire else { return }
-        let fire = computeNextFire()
-        nextFireDate = fire
-        isArmed = true
+    /// Wire up what to do when any alarm fires (called on main).
+    func setOnFire(_ handler: @escaping (AlarmProfile) -> Void) {
+        onFireHandler = handler
+        rescheduleAll()
+    }
+
+    func addAlarm(_ alarm: AlarmProfile) {
+        alarms.append(alarm)
+        save()
+        if alarm.isEnabled { schedule(alarm) }
+    }
+
+    func removeAlarm(id: UUID) {
+        cancel(id: id)
+        alarms.removeAll { $0.id == id }
+        save()
+    }
+
+    func updateAlarm(_ alarm: AlarmProfile) {
+        guard let idx = alarms.firstIndex(where: { $0.id == alarm.id }) else { return }
+        alarms[idx] = alarm
+        save()
+        cancel(id: alarm.id)
+        if alarm.isEnabled { schedule(alarm) }
+    }
+
+    func toggle(id: UUID, on: Bool) {
+        guard let idx = alarms.firstIndex(where: { $0.id == id }) else { return }
+        alarms[idx].isEnabled = on
+        save()
+        cancel(id: id)
+        if on { schedule(alarms[idx]) }
+    }
+
+    /// Snooze a currently-firing alarm by N minutes. Uses the same alarm profile again.
+    func snooze(alarmID: UUID, minutes: Int) {
+        guard let a = alarms.first(where: { $0.id == alarmID }) else { return }
+        cancel(id: alarmID)
+        let fire = Date().addingTimeInterval(Double(minutes) * 60)
+        nextFires[alarmID] = fire
+        tasks[alarmID] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Double(minutes) * 60 * 1_000_000_000))
+            if Task.isCancelled { return }
+            await MainActor.run {
+                self?.onFireHandler?(a)
+                // After snooze, reschedule the normal next occurrence
+                if a.repeatDays.isEmpty {
+                    self?.toggle(id: a.id, on: false)  // one-shot done
+                } else {
+                    self?.schedule(a)
+                }
+            }
+        }
+    }
+
+    // MARK: - Internals
+
+    private func rescheduleAll() {
+        for a in alarms {
+            cancel(id: a.id)
+            if a.isEnabled { schedule(a) }
+        }
+    }
+
+    private func schedule(_ alarm: AlarmProfile) {
+        guard onFireHandler != nil else { return }
+        guard let fire = computeNextFire(for: alarm) else { return }
+        nextFires[alarm.id] = fire
         let delay = fire.timeIntervalSinceNow
-        task = Task { [weak self] in
+        tasks[alarm.id] = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
             if Task.isCancelled { return }
             await MainActor.run {
                 guard let self = self else { return }
-                onFire()
-                if self.repeatDays.isEmpty {
-                    // one-shot: disarm
-                    self.isArmed = false
-                    self.nextFireDate = nil
-                    self.currentOnFire = nil
+                self.onFireHandler?(alarm)
+                if alarm.repeatDays.isEmpty {
+                    // Disable one-shot
+                    self.toggle(id: alarm.id, on: false)
                 } else {
-                    // repeating: schedule again for next matching day
-                    self.scheduleNext()
+                    self.schedule(alarm)
                 }
             }
         }
     }
 
-    func cancel() {
-        task?.cancel()
-        task = nil
-        isArmed = false
-        nextFireDate = nil
-        currentOnFire = nil
+    private func cancel(id: UUID) {
+        tasks[id]?.cancel()
+        tasks[id] = nil
+        nextFires.removeValue(forKey: id)
     }
 
-    /// Snooze by minutes: cancel current fire, refire after N minutes.
-    /// Does not touch alarm settings — just delays the current wake.
-    func snooze(minutes: Int, onFire: @escaping () -> Void) {
-        task?.cancel()
-        currentOnFire = onFire
-        isArmed = true
-        let fire = Date().addingTimeInterval(Double(minutes) * 60)
-        nextFireDate = fire
-        task = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(Double(minutes) * 60 * 1_000_000_000))
-            if Task.isCancelled { return }
-            await MainActor.run {
-                guard let self = self else { return }
-                onFire()
-                if self.repeatDays.isEmpty {
-                    self.isArmed = false
-                    self.nextFireDate = nil
-                    self.currentOnFire = nil
-                } else {
-                    self.scheduleNext()
-                }
+    private func computeNextFire(for alarm: AlarmProfile, now: Date = Date()) -> Date? {
+        var comps = DateComponents()
+        comps.hour = alarm.hour
+        comps.minute = alarm.minute
+        comps.second = 0
+        let cal = Calendar.current
+
+        if alarm.repeatDays.isEmpty {
+            return cal.nextDate(after: now, matching: comps, matchingPolicy: .nextTime, direction: .forward)
+        }
+        for daysAhead in 0..<8 {
+            guard let candidate = cal.date(byAdding: .day, value: daysAhead, to: now) else { continue }
+            var c = cal.dateComponents([.year, .month, .day], from: candidate)
+            c.hour = alarm.hour
+            c.minute = alarm.minute
+            c.second = 0
+            if let date = cal.date(from: c),
+               date > now,
+               alarm.repeatDays.contains(cal.component(.weekday, from: date)) {
+                return date
             }
+        }
+        return nil
+    }
+
+    private func save() {
+        if let data = try? JSONEncoder().encode(alarms) {
+            UserDefaults.standard.set(data, forKey: Self.key)
+        }
+    }
+
+    private func load() {
+        guard let data = UserDefaults.standard.data(forKey: Self.key) else { return }
+        if let decoded = try? JSONDecoder().decode([AlarmProfile].self, from: data) {
+            alarms = decoded
         }
     }
 }

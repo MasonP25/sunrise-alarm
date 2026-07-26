@@ -10,14 +10,17 @@ struct ContentView: View {
     @State private var ambient = AmbientSoundPlayer()
 
     @State private var showingPaletteEditor = false
+    @State private var editingAlarm: AlarmProfile? = nil
+    @State private var creatingAlarm = false
+    @State private var firingAlarmID: UUID? = nil    // tracked so snooze knows which alarm to reschedule
 
-    // Sunset settings (persisted)
-    @State private var sunsetMinutes: Int = UserDefaults.standard.integer(forKey: "sunset_minutes") == 0 ? 30 : UserDefaults.standard.integer(forKey: "sunset_minutes")
+    // Sunset
+    @State private var sunsetMinutes: Int = max(30, UserDefaults.standard.integer(forKey: "sunset_minutes"))
 
-    // Ambient sound settings
+    // Ambient sound
     @State private var soundEnabled: Bool = UserDefaults.standard.bool(forKey: "sound_enabled")
     @State private var soundType: AmbientSoundType = AmbientSoundType(rawValue: UserDefaults.standard.string(forKey: "sound_type") ?? "") ?? .brownNoise
-    @State private var soundFadeMinutes: Int = UserDefaults.standard.integer(forKey: "sound_fade") == 0 ? 10 : UserDefaults.standard.integer(forKey: "sound_fade")
+    @State private var soundFadeMinutes: Int = max(10, UserDefaults.standard.integer(forKey: "sound_fade"))
 
     private var hasConnectedPeer: Bool {
         ble.peers.contains { $0.isSelected && $0.isConnected }
@@ -29,7 +32,7 @@ struct ContentView: View {
                 VStack(spacing: 18) {
                     statusText
                     previewSwatch
-                    alarmCard
+                    alarmsCard
                     sunsetCard
                     soundCard
                     demoButton
@@ -43,15 +46,51 @@ struct ContentView: View {
             .sheet(isPresented: $showingPaletteEditor) {
                 PaletteEditorView(store: paletteStore)
             }
+            .sheet(item: $editingAlarm) { existing in
+                AlarmEditView(
+                    paletteStore: paletteStore,
+                    existing: existing,
+                    onSave: { updated in
+                        alarm.updateAlarm(updated)
+                        syncKeepAlive()
+                    },
+                    onDelete: {
+                        alarm.removeAlarm(id: existing.id)
+                        syncKeepAlive()
+                    }
+                )
+            }
+            .sheet(isPresented: $creatingAlarm) {
+                AlarmEditView(
+                    paletteStore: paletteStore,
+                    existing: nil,
+                    onSave: { newAlarm in
+                        alarm.addAlarm(newAlarm)
+                        syncKeepAlive()
+                    },
+                    onDelete: nil
+                )
+            }
+            .onAppear {
+                alarm.setOnFire { profile in
+                    fireSunrise(for: profile)
+                }
+                syncKeepAlive()
+            }
         }
     }
 
     // MARK: - Status + preview
 
     private var statusText: some View {
-        Text(ble.status)
-            .font(.footnote)
-            .foregroundStyle(.secondary)
+        VStack(spacing: 2) {
+            Text(ble.status)
+                .font(.footnote).foregroundStyle(.secondary)
+            if let (a, d) = alarm.soonestNextFire {
+                Text("Next: \(a.name) — \(formatFireDate(d))")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
     }
 
     private var previewSwatch: some View {
@@ -73,138 +112,63 @@ struct ContentView: View {
             }
     }
 
-    // MARK: - Alarm
+    // MARK: - Alarms list
 
-    private var alarmCard: some View {
-        VStack(spacing: 12) {
-            wakeTimePicker
-            durationRow
-            paletteRow
-            palettePreviewStrip
-            repeatDaysChips
-            armButton
+    private var alarmsCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Alarms").font(.headline)
+                Spacer()
+                Button {
+                    creatingAlarm = true
+                } label: {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.title3)
+                }
+            }
+            if alarm.alarms.isEmpty {
+                Text("No alarms yet. Tap + to add one.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(alarm.alarms) { a in
+                alarmRow(a)
+            }
             snoozeButton
         }
         .padding()
         .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.10)))
     }
 
-    private var wakeTimePicker: some View {
-        DatePicker(
-            "Wake up at",
-            selection: Binding(
-                get: {
-                    var comps = Calendar.current.dateComponents([.year, .month, .day], from: Date())
-                    comps.hour = alarm.alarmHour
-                    comps.minute = alarm.alarmMinute
-                    return Calendar.current.date(from: comps) ?? Date()
-                },
-                set: { newDate in
-                    let c = Calendar.current.dateComponents([.hour, .minute], from: newDate)
-                    alarm.alarmHour = c.hour ?? 7
-                    alarm.alarmMinute = c.minute ?? 0
-                }),
-            displayedComponents: .hourAndMinute
-        )
-        .datePickerStyle(.compact)
-    }
-
-    private var durationRow: some View {
+    private func alarmRow(_ a: AlarmProfile) -> some View {
         HStack {
-            Text("Sunrise length")
+            VStack(alignment: .leading, spacing: 3) {
+                Text(a.name).font(.subheadline).bold()
+                Text(timeString(hour: a.hour, minute: a.minute))
+                    .font(.system(.title2, design: .rounded))
+                Text(daysString(a.repeatDays))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Spacer()
-            Picker("Duration", selection: Binding(
-                get: { alarm.durationMinutes },
-                set: { alarm.durationMinutes = $0 })) {
-                ForEach([5, 10, 15, 20, 30, 45, 60], id: \.self) { m in
-                    Text("\(m) min").tag(m)
-                }
-            }
-            .pickerStyle(.menu)
+            Toggle("", isOn: Binding(
+                get: { a.isEnabled },
+                set: { on in
+                    alarm.toggle(id: a.id, on: on)
+                    syncKeepAlive()
+                }))
+                .labelsHidden()
         }
-    }
-
-    private var paletteRow: some View {
-        HStack {
-            Text("Palette")
-            Spacer()
-            Picker("Palette", selection: Binding(
-                get: { paletteStore.activeID ?? paletteStore.palettes.first?.id ?? UUID() },
-                set: { newID in
-                    if let p = paletteStore.palettes.first(where: { $0.id == newID }) {
-                        paletteStore.setActive(p)
-                    }
-                })) {
-                ForEach(paletteStore.palettes) { p in
-                    Text(p.name).tag(p.id)
-                }
-            }
-            .pickerStyle(.menu)
-            Button { showingPaletteEditor = true } label: {
-                Image(systemName: "pencil")
-            }
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            editingAlarm = a
         }
-    }
-
-    private var palettePreviewStrip: some View {
-        HStack(spacing: 0) {
-            ForEach(Array(sampledPreviewColors().enumerated()), id: \.offset) { _, c in
-                Rectangle().fill(c)
-            }
-        }
-        .frame(height: 20)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-    }
-
-    private var repeatDaysChips: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Repeat")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            HStack(spacing: 6) {
-                ForEach(1...7, id: \.self) { day in
-                    dayChip(day)
-                }
-            }
-        }
-    }
-
-    private func dayChip(_ day: Int) -> some View {
-        let selected = alarm.repeatDays.contains(day)
-        let label = ["S", "M", "T", "W", "T", "F", "S"][day - 1]
-        return Button {
-            if selected { alarm.repeatDays.remove(day) }
-            else { alarm.repeatDays.insert(day) }
-        } label: {
-            Text(label)
-                .font(.system(.footnote, design: .rounded)).bold()
-                .frame(width: 32, height: 32)
-                .background(Circle().fill(selected ? Color.orange : Color.gray.opacity(0.2)))
-                .foregroundStyle(selected ? .white : .primary)
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var armButton: some View {
-        Button {
-            toggleAlarm()
-        } label: {
-            Text(alarm.isArmed
-                 ? "Disarm — fires \(nextFireString())"
-                 : "Arm Alarm")
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
-        }
-        .buttonStyle(.borderedProminent)
-        .tint(alarm.isArmed ? .red : .orange)
     }
 
     @ViewBuilder
     private var snoozeButton: some View {
-        if animator.isRunning {
+        if animator.isRunning, let id = firingAlarmID {
             Button {
-                snoozeCurrent()
+                snoozeCurrent(id: id)
             } label: {
                 HStack {
                     Image(systemName: "zzz")
@@ -223,8 +187,7 @@ struct ContentView: View {
     private var sunsetCard: some View {
         VStack(spacing: 10) {
             HStack {
-                Text("Sunset (fade to sleep)")
-                    .font(.headline)
+                Text("Sunset (fade to sleep)").font(.headline)
                 Spacer()
                 Picker("Length", selection: Binding(
                     get: { sunsetMinutes },
@@ -243,8 +206,7 @@ struct ContentView: View {
                     Image(systemName: "moon.fill")
                     Text("Start Sunset")
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity).padding(.vertical, 6)
             }
             .buttonStyle(.borderedProminent)
             .tint(.purple)
@@ -304,8 +266,7 @@ struct ContentView: View {
                     Image(systemName: ambient.isPlaying ? "stop.fill" : "play.fill")
                     Text(ambient.isPlaying ? "Stop Sound" : "Play Sound")
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity).padding(.vertical, 6)
             }
             .buttonStyle(.bordered)
             .disabled(!soundEnabled)
@@ -374,13 +335,24 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
             }
             if ble.peers.isEmpty {
-                Text("Tap Scan to find your LED strips.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text("Tap Scan to find your LED strips.").font(.caption).foregroundStyle(.secondary)
             }
             ForEach(ble.peers, id: \.id) { peer in
                 deviceRow(peer)
             }
+            NavigationLink {
+                PaletteEditorRoot(store: paletteStore)
+            } label: {
+                HStack {
+                    Text("Palettes").font(.subheadline)
+                    Spacer()
+                    Text("\(paletteStore.palettes.count)")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
+                }
+                .padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
         }
         .padding()
         .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.10)))
@@ -400,9 +372,7 @@ struct ContentView: View {
                         .foregroundStyle(peer.isConnected ? .green : .secondary)
                 }
                 Spacer()
-                Text("\(peer.rssi)")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                Text("\(peer.rssi)").font(.caption2).foregroundStyle(.tertiary)
             }
             .padding(.vertical, 4)
             .contentShape(Rectangle())
@@ -412,28 +382,20 @@ struct ContentView: View {
 
     // MARK: - Actions
 
-    private func toggleAlarm() {
-        if alarm.isArmed {
-            alarm.cancel()
-            keepAlive.stop()
-        } else {
-            alarm.arm { fireSunrise() }
-            keepAlive.start()
-        }
-    }
-
-    private func fireSunrise() {
-        let seconds = Double(alarm.durationMinutes) * 60
+    private func fireSunrise(for profile: AlarmProfile) {
+        firingAlarmID = profile.id
+        let palette = paletteStore.palettes.first(where: { $0.id == profile.paletteID })
+            ?? paletteStore.activePalette
         animator.run(
-            palette: paletteStore.activePalette,
-            durationSeconds: seconds,
+            palette: palette,
+            durationSeconds: Double(profile.durationMinutes) * 60,
             ble: ble
         )
     }
 
-    private func snoozeCurrent() {
+    private func snoozeCurrent(id: UUID) {
         animator.cancel()
-        alarm.snooze(minutes: 10) { fireSunrise() }
+        alarm.snooze(alarmID: id, minutes: 10)
     }
 
     private func startSunset() {
@@ -443,7 +405,7 @@ struct ContentView: View {
             ble: ble,
             reversed: true
         )
-        keepAlive.start()  // stay awake for the fade
+        keepAlive.start()
     }
 
     private func runDemo(seconds: Double) {
@@ -454,28 +416,54 @@ struct ContentView: View {
         )
     }
 
-    private func sampledPreviewColors() -> [Color] {
-        let p = paletteStore.activePalette
-        return (0..<40).map { i in
-            let (r, g, b) = PaletteInterp.color(at: Double(i) / 39.0, palette: p)
-            return Color(red: Double(r)/255, green: Double(g)/255, blue: Double(b)/255)
+    /// Keep the app awake whenever any alarm is enabled (so it can actually fire overnight).
+    private func syncKeepAlive() {
+        if alarm.hasEnabledAlarm {
+            keepAlive.start()
+        } else if !ambient.isPlaying && !animator.isRunning {
+            keepAlive.stop()
         }
     }
 
-    private func nextFireString() -> String {
-        guard let d = alarm.nextFireDate else { return "?" }
+    // MARK: - Formatters
+
+    private func timeString(hour: Int, minute: Int) -> String {
+        let c = DateComponents(hour: hour, minute: minute)
+        let d = Calendar.current.date(from: c) ?? Date()
+        let df = DateFormatter()
+        df.dateFormat = "h:mm a"
+        return df.string(from: d)
+    }
+
+    private func daysString(_ days: Set<Int>) -> String {
+        if days.isEmpty { return "Once" }
+        if days == [1,2,3,4,5,6,7] { return "Every day" }
+        if days == [2,3,4,5,6] { return "Weekdays" }
+        if days == [1,7] { return "Weekends" }
+        let labels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        return days.sorted().map { labels[$0 - 1] }.joined(separator: " ")
+    }
+
+    private func formatFireDate(_ d: Date) -> String {
         let df = DateFormatter()
         let cal = Calendar.current
-        if cal.isDateInToday(d) || cal.isDateInTomorrow(d) {
-            df.dateFormat = "EEE h:mm a"
-        } else {
-            df.dateFormat = "EEE MMM d, h:mm a"
-        }
+        if cal.isDateInToday(d) { df.dateFormat = "'today' h:mm a" }
+        else if cal.isDateInTomorrow(d) { df.dateFormat = "'tomorrow' h:mm a" }
+        else { df.dateFormat = "EEE h:mm a" }
         return df.string(from: d)
     }
 }
 
-// MARK: - Palette Editor (supports 10+ colors)
+// MARK: - Palettes list root (wraps PaletteEditorView for NavigationLink use)
+
+struct PaletteEditorRoot: View {
+    @Bindable var store: PaletteStore
+    var body: some View {
+        PaletteEditorView(store: store)
+    }
+}
+
+// MARK: - Palette Editor (up to 15 colors)
 
 struct PaletteEditorView: View {
     @Bindable var store: PaletteStore
@@ -513,9 +501,7 @@ struct PaletteEditorView: View {
                 paletteRow(p)
             }
             .onDelete { indexSet in
-                for i in indexSet {
-                    store.delete(store.palettes[i])
-                }
+                for i in indexSet { store.delete(store.palettes[i]) }
             }
             HStack {
                 TextField("New palette name", text: $newPaletteName)
@@ -536,8 +522,7 @@ struct PaletteEditorView: View {
             Text(p.name)
             Spacer()
             if store.activeID == p.id {
-                Image(systemName: "checkmark")
-                    .foregroundStyle(Color.accentColor)
+                Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
             }
         }
         .contentShape(Rectangle())
@@ -561,7 +546,6 @@ struct PaletteEditorView: View {
                 p.colors.move(fromOffsets: indices, toOffset: newOffset)
                 store.update(p)
             }
-
             if store.activePalette.colors.count < 15 {
                 Button {
                     var p = store.activePalette
@@ -580,8 +564,7 @@ struct PaletteEditorView: View {
                 .fill(color.swiftUIColor)
                 .frame(width: 44, height: 30)
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.4)))
-            Text("Color \(idx + 1)")
-                .font(.subheadline)
+            Text("Color \(idx + 1)").font(.subheadline)
             Spacer()
             Button("Edit") {
                 editingIndex = idx
@@ -595,13 +578,10 @@ struct PaletteEditorView: View {
         NavigationStack {
             VStack {
                 ColorPicker("Color \(wrap.index + 1)", selection: $editingColor, supportsOpacity: false)
-                    .labelsHidden()
-                    .scaleEffect(1.5)
-                    .padding()
+                    .labelsHidden().scaleEffect(1.5).padding()
                 Spacer()
             }
-            .navigationTitle("Edit Color")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Edit Color").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Save") { saveEditedColor(index: wrap.index) }
