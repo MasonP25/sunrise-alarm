@@ -111,8 +111,9 @@ extension BluetoothManager: CBCentralManagerDelegate {
                         rssi RSSI: NSNumber) {
         let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = peripheral.name ?? advName ?? ""
-        let upper = name.uppercased()
-        guard upper.contains("ELK") || upper.contains("BLEDOM") || upper.contains("MELK") else { return }
+        // Show every named BLE device so obscure strip brands are visible too.
+        // Filter out unnamed ones to reduce noise (headphones, phones, etc still show but are named).
+        guard !name.isEmpty else { return }
 
         peripheralsByID[peripheral.identifier] = peripheral
 
