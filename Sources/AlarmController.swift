@@ -37,7 +37,10 @@ class AlarmController {
     var nextFires: [UUID: Date] = [:]
 
     private var tasks: [UUID: Task<Void, Never>] = [:]
-    private var onFireHandler: ((AlarmProfile) -> Void)? = nil
+    // Callback receives (profile, effectiveDurationSeconds).
+    // effectiveDuration is the profile's full duration when scheduled normally,
+    // or reduced if the app opened after the intended start time.
+    private var onFireHandler: ((AlarmProfile, TimeInterval) -> Void)? = nil
 
     var hasEnabledAlarm: Bool { alarms.contains { $0.isEnabled } }
 
@@ -65,7 +68,8 @@ class AlarmController {
     }
 
     /// Wire up what to do when any alarm fires (called on main).
-    func setOnFire(_ handler: @escaping (AlarmProfile) -> Void) {
+    /// Handler receives (profile, effectiveDurationSeconds).
+    func setOnFire(_ handler: @escaping (AlarmProfile, TimeInterval) -> Void) {
         onFireHandler = handler
         rescheduleAll()
     }
@@ -98,7 +102,7 @@ class AlarmController {
         if on { schedule(alarms[idx]) }
     }
 
-    /// Snooze a currently-firing alarm by N minutes. Uses the same alarm profile again.
+    /// Snooze a currently-firing alarm by N minutes. Runs a compressed 5-minute sunrise then.
     func snooze(alarmID: UUID, minutes: Int) {
         guard let a = alarms.first(where: { $0.id == alarmID }) else { return }
         cancel(id: alarmID)
@@ -108,10 +112,10 @@ class AlarmController {
             try? await Task.sleep(nanoseconds: UInt64(Double(minutes) * 60 * 1_000_000_000))
             if Task.isCancelled { return }
             await MainActor.run {
-                self?.onFireHandler?(a)
-                // After snooze, reschedule the normal next occurrence
+                // Snooze wake = punchy 5-min sunrise (they want to actually get up now).
+                self?.onFireHandler?(a, 5 * 60)
                 if a.repeatDays.isEmpty {
-                    self?.toggle(id: a.id, on: false)  // one-shot done
+                    self?.toggle(id: a.id, on: false)
                 } else {
                     self?.schedule(a)
                 }
@@ -130,17 +134,38 @@ class AlarmController {
 
     private func schedule(_ alarm: AlarmProfile) {
         guard onFireHandler != nil else { return }
-        guard let fire = computeNextFire(for: alarm) else { return }
-        nextFires[alarm.id] = fire
-        let delay = fire.timeIntervalSinceNow
+        guard let wakeTime = computeNextFire(for: alarm) else { return }
+        // Sunrise should PEAK at wake time — schedule the animation start
+        // durationMinutes BEFORE wake time so the final bright frame lands at wake.
+        nextFires[alarm.id] = wakeTime  // display: user's set wake time
+        let fullDuration = Double(alarm.durationMinutes) * 60
+        let startTime = wakeTime.addingTimeInterval(-fullDuration)
+        let now = Date()
+
+        let delay: TimeInterval
+        let effectiveDuration: TimeInterval
+        if startTime <= now && now < wakeTime {
+            // We're already inside the sunrise window (app opened late).
+            // Start immediately with reduced duration ending at wake time.
+            delay = 0
+            effectiveDuration = max(30, wakeTime.timeIntervalSince(now))
+        } else if now >= wakeTime {
+            // Already past wake time (shouldn't happen for future wake but guard anyway).
+            // Just fire immediately with the full duration.
+            delay = 0
+            effectiveDuration = fullDuration
+        } else {
+            delay = startTime.timeIntervalSince(now)
+            effectiveDuration = fullDuration
+        }
+
         tasks[alarm.id] = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             if Task.isCancelled { return }
             await MainActor.run {
                 guard let self = self else { return }
-                self.onFireHandler?(alarm)
+                self.onFireHandler?(alarm, effectiveDuration)
                 if alarm.repeatDays.isEmpty {
-                    // Disable one-shot
                     self.toggle(id: alarm.id, on: false)
                 } else {
                     self.schedule(alarm)

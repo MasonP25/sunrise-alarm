@@ -9,15 +9,16 @@ struct ContentView: View {
     @State private var keepAlive = BackgroundKeepAlive()
     @State private var ambient = AmbientSoundPlayer()
 
-    @State private var showingPaletteEditor = false
     @State private var editingAlarm: AlarmProfile? = nil
     @State private var creatingAlarm = false
-    @State private var firingAlarmID: UUID? = nil    // tracked so snooze knows which alarm to reschedule
+    @State private var firingAlarmID: UUID? = nil
+    @State private var showingDevices = false
+    @State private var showingPalettes = false
 
-    // Sunset
+    @State private var tickToRefresh = 0
+    private let uiTicker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
     @State private var sunsetMinutes: Int = max(30, UserDefaults.standard.integer(forKey: "sunset_minutes"))
-
-    // Ambient sound
     @State private var soundEnabled: Bool = UserDefaults.standard.bool(forKey: "sound_enabled")
     @State private var soundType: AmbientSoundType = AmbientSoundType(rawValue: UserDefaults.standard.string(forKey: "sound_type") ?? "") ?? .brownNoise
     @State private var soundFadeMinutes: Int = max(10, UserDefaults.standard.integer(forKey: "sound_fade"))
@@ -28,23 +29,47 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 18) {
-                    statusText
-                    previewSwatch
-                    alarmsCard
-                    sunsetCard
-                    soundCard
-                    demoButton
-                    manualControls
-                    devicesCard
+            ZStack {
+                backgroundGradient
+                ScrollView {
+                    VStack(spacing: 16) {
+                        heroCard
+                        alarmsCard
+                        sunsetCard
+                        soundCard
+                        Divider().padding(.horizontal, 40).opacity(0.4)
+                        quickActionsRow
+                        Spacer().frame(height: 20)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
                 }
-                .padding()
             }
             .navigationTitle("Sunrise")
             .navigationBarTitleDisplayMode(.inline)
-            .sheet(isPresented: $showingPaletteEditor) {
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button {
+                            showingDevices = true
+                        } label: {
+                            Label("Devices (\(ble.peers.count))", systemImage: "dot.radiowaves.left.and.right")
+                        }
+                        Button {
+                            showingPalettes = true
+                        } label: {
+                            Label("Palettes", systemImage: "paintpalette")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
+            }
+            .sheet(isPresented: $showingPalettes) {
                 PaletteEditorView(store: paletteStore)
+            }
+            .sheet(isPresented: $showingDevices) {
+                DevicesSheet(ble: ble)
             }
             .sheet(item: $editingAlarm) { existing in
                 AlarmEditView(
@@ -72,96 +97,142 @@ struct ContentView: View {
                 )
             }
             .onAppear {
-                alarm.setOnFire { profile in
-                    fireSunrise(for: profile)
+                alarm.setOnFire { profile, duration in
+                    fireSunrise(for: profile, duration: duration)
                 }
                 syncKeepAlive()
             }
-        }
-    }
-
-    // MARK: - Status + preview
-
-    private var statusText: some View {
-        VStack(spacing: 2) {
-            Text(ble.status)
-                .font(.footnote).foregroundStyle(.secondary)
-            if let (a, d) = alarm.soonestNextFire {
-                Text("Next: \(a.name) — \(formatFireDate(d))")
-                    .font(.caption2).foregroundStyle(.tertiary)
+            .onReceive(uiTicker) { _ in
+                tickToRefresh &+= 1  // trigger view refresh so countdowns tick
             }
         }
     }
 
-    private var previewSwatch: some View {
-        RoundedRectangle(cornerRadius: 12)
-            .fill(Color(
-                red:   Double(animator.currentColor.r) / 255,
-                green: Double(animator.currentColor.g) / 255,
-                blue:  Double(animator.currentColor.b) / 255
-            ))
-            .frame(height: 60)
-            .overlay(alignment: .leading) {
+    // MARK: - Background + Hero
+
+    private var backgroundGradient: some View {
+        LinearGradient(
+            colors: [
+                Color(red: 0.05, green: 0.02, blue: 0.10),
+                Color(red: 0.10, green: 0.05, blue: 0.18),
+                Color(red: 0.18, green: 0.08, blue: 0.15)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        .ignoresSafeArea()
+    }
+
+    private var heroCard: some View {
+        VStack(spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 20)
+                    .fill(Color(
+                        red:   Double(animator.currentColor.r) / 255,
+                        green: Double(animator.currentColor.g) / 255,
+                        blue:  Double(animator.currentColor.b) / 255
+                    ))
+                    .frame(height: 100)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 20)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    )
                 if animator.isRunning {
-                    Text("\(Int(animator.progress * 100))%")
-                        .font(.system(.footnote, design: .monospaced))
-                        .foregroundStyle(.white)
-                        .shadow(radius: 2)
-                        .padding(.leading, 12)
+                    VStack(spacing: 2) {
+                        Text("SUNRISE")
+                            .font(.system(.caption2, design: .rounded))
+                            .fontWeight(.heavy)
+                            .kerning(1.5)
+                            .foregroundStyle(.white.opacity(0.9))
+                        Text("\(Int(animator.progress * 100))%")
+                            .font(.system(.title, design: .rounded, weight: .bold))
+                            .foregroundStyle(.white)
+                            .shadow(radius: 3)
+                    }
                 }
             }
+            if let (nextAlarm, wakeAt) = alarm.soonestNextFire {
+                HStack(spacing: 6) {
+                    Image(systemName: "alarm.fill")
+                        .foregroundStyle(.orange)
+                    Text("Next: \(nextAlarm.name) — \(formatCountdown(to: wakeAt))")
+                        .font(.system(.footnote, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.9))
+                }
+            }
+        }
     }
 
-    // MARK: - Alarms list
+    // MARK: - Alarms
 
     private var alarmsCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Alarms").font(.headline)
-                Spacer()
+        card(title: "Alarms", icon: "alarm.fill", accent: .orange, trailing: {
+            AnyView(
                 Button {
                     creatingAlarm = true
                 } label: {
                     Image(systemName: "plus.circle.fill")
                         .font(.title3)
+                        .foregroundStyle(Color.orange)
                 }
-            }
-            if alarm.alarms.isEmpty {
-                Text("No alarms yet. Tap + to add one.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            ForEach(alarm.alarms) { a in
-                alarmRow(a)
+            )
+        }) {
+            AnyView(alarmsContent)
+        }
+    }
+
+    @ViewBuilder
+    private var alarmsContent: some View {
+        if alarm.alarms.isEmpty {
+            emptyState(icon: "alarm", text: "No alarms yet.\nTap + to add one.")
+        } else {
+            VStack(spacing: 8) {
+                ForEach(alarm.alarms) { a in
+                    alarmRow(a)
+                }
             }
             snoozeButton
         }
-        .padding()
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.10)))
     }
 
     private func alarmRow(_ a: AlarmProfile) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(a.name).font(.subheadline).bold()
-                Text(timeString(hour: a.hour, minute: a.minute))
-                    .font(.system(.title2, design: .rounded))
-                Text(daysString(a.repeatDays))
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Spacer()
-            Toggle("", isOn: Binding(
-                get: { a.isEnabled },
-                set: { on in
-                    alarm.toggle(id: a.id, on: on)
-                    syncKeepAlive()
-                }))
-                .labelsHidden()
-        }
-        .padding(.vertical, 6)
-        .contentShape(Rectangle())
-        .onTapGesture {
+        Button {
             editingAlarm = a
+        } label: {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(timeString(hour: a.hour, minute: a.minute))
+                        .font(.system(.largeTitle, design: .rounded, weight: .semibold))
+                        .foregroundStyle(a.isEnabled ? .white : Color.white.opacity(0.4))
+                        .monospacedDigit()
+                    HStack(spacing: 6) {
+                        Text(a.name)
+                            .font(.footnote)
+                            .foregroundStyle(a.isEnabled ? Color.white.opacity(0.7) : Color.white.opacity(0.3))
+                        Text("·")
+                            .foregroundStyle(Color.white.opacity(0.3))
+                        Text(daysString(a.repeatDays))
+                            .font(.footnote)
+                            .foregroundStyle(a.isEnabled ? Color.white.opacity(0.7) : Color.white.opacity(0.3))
+                    }
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { a.isEnabled },
+                    set: { on in
+                        alarm.toggle(id: a.id, on: on)
+                        syncKeepAlive()
+                    }))
+                    .labelsHidden()
+                    .tint(.orange)
+            }
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.white.opacity(a.isEnabled ? 0.06 : 0.03))
+            )
         }
+        .buttonStyle(.plain)
     }
 
     @ViewBuilder
@@ -173,22 +244,26 @@ struct ContentView: View {
                 HStack {
                     Image(systemName: "zzz")
                     Text("Snooze 10 min")
+                        .fontWeight(.medium)
                 }
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
+                .padding(.vertical, 12)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.blue.opacity(0.25))
+                )
+                .foregroundStyle(.white)
             }
-            .buttonStyle(.bordered)
-            .tint(.blue)
+            .buttonStyle(.plain)
+            .padding(.top, 4)
         }
     }
 
     // MARK: - Sunset
 
     private var sunsetCard: some View {
-        VStack(spacing: 10) {
-            HStack {
-                Text("Sunset (fade to sleep)").font(.headline)
-                Spacer()
+        card(title: "Sunset", icon: "moon.fill", accent: .purple, trailing: {
+            AnyView(
                 Picker("Length", selection: Binding(
                     get: { sunsetMinutes },
                     set: {
@@ -198,65 +273,81 @@ struct ContentView: View {
                     ForEach([5, 10, 15, 20, 30, 45, 60], id: \.self) { Text("\($0) min").tag($0) }
                 }
                 .pickerStyle(.menu)
-            }
-            Button {
-                startSunset()
-            } label: {
-                HStack {
-                    Image(systemName: "moon.fill")
-                    Text("Start Sunset")
+                .tint(Color.white.opacity(0.9))
+            )
+        }) {
+            AnyView(
+                Button {
+                    startSunset()
+                } label: {
+                    HStack {
+                        Image(systemName: "moon.stars.fill")
+                        Text("Fade to sleep")
+                            .fontWeight(.medium)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(hasConnectedPeer
+                                  ? LinearGradient(colors: [.purple, .indigo], startPoint: .leading, endPoint: .trailing)
+                                  : LinearGradient(colors: [Color.gray.opacity(0.4)], startPoint: .top, endPoint: .bottom))
+                    )
+                    .foregroundStyle(.white)
                 }
-                .frame(maxWidth: .infinity).padding(.vertical, 6)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.purple)
-            .disabled(!hasConnectedPeer)
+                .buttonStyle(.plain)
+                .disabled(!hasConnectedPeer)
+            )
         }
-        .padding()
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.10)))
     }
 
     // MARK: - Ambient sound
 
     private var soundCard: some View {
-        VStack(spacing: 10) {
-            HStack {
-                Text("Ambient Sound").font(.headline)
-                Spacer()
+        card(title: "Ambient Sound", icon: "waveform", accent: .teal, trailing: {
+            AnyView(
                 Toggle("", isOn: $soundEnabled)
                     .labelsHidden()
+                    .tint(.teal)
                     .onChange(of: soundEnabled) { _, v in
                         UserDefaults.standard.set(v, forKey: "sound_enabled")
                         if !v { ambient.stop() }
                     }
-            }
-            HStack {
-                Text("Type")
-                Spacer()
-                Picker("Type", selection: Binding(
-                    get: { soundType },
-                    set: {
-                        soundType = $0
-                        UserDefaults.standard.set($0.rawValue, forKey: "sound_type")
-                    })) {
-                    ForEach(AmbientSoundType.allCases) { t in
-                        Text(t.rawValue).tag(t)
+            )
+        }) {
+            AnyView(soundContent)
+        }
+    }
+
+    private var soundContent: some View {
+        VStack(spacing: 10) {
+            settingRow(label: "Type") {
+                AnyView(
+                    Picker("Type", selection: Binding(
+                        get: { soundType },
+                        set: {
+                            soundType = $0
+                            UserDefaults.standard.set($0.rawValue, forKey: "sound_type")
+                        })) {
+                        ForEach(AmbientSoundType.allCases) { t in Text(t.rawValue).tag(t) }
                     }
-                }
-                .pickerStyle(.menu)
+                    .pickerStyle(.menu)
+                    .tint(Color.white.opacity(0.9))
+                )
             }
-            HStack {
-                Text("Fade in over")
-                Spacer()
-                Picker("Fade", selection: Binding(
-                    get: { soundFadeMinutes },
-                    set: {
-                        soundFadeMinutes = $0
-                        UserDefaults.standard.set($0, forKey: "sound_fade")
-                    })) {
-                    ForEach([1, 3, 5, 10, 15, 20, 30], id: \.self) { Text("\($0) min").tag($0) }
-                }
-                .pickerStyle(.menu)
+            settingRow(label: "Fade in") {
+                AnyView(
+                    Picker("Fade", selection: Binding(
+                        get: { soundFadeMinutes },
+                        set: {
+                            soundFadeMinutes = $0
+                            UserDefaults.standard.set($0, forKey: "sound_fade")
+                        })) {
+                        ForEach([1, 3, 5, 10, 15, 20, 30], id: \.self) { Text("\($0) min").tag($0) }
+                    }
+                    .pickerStyle(.menu)
+                    .tint(Color.white.opacity(0.9))
+                )
             }
             Button {
                 if ambient.isPlaying { ambient.stop() }
@@ -265,130 +356,155 @@ struct ContentView: View {
                 HStack {
                     Image(systemName: ambient.isPlaying ? "stop.fill" : "play.fill")
                     Text(ambient.isPlaying ? "Stop Sound" : "Play Sound")
+                        .fontWeight(.medium)
                 }
-                .frame(maxWidth: .infinity).padding(.vertical, 6)
-            }
-            .buttonStyle(.bordered)
-            .disabled(!soundEnabled)
-        }
-        .padding()
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.10)))
-    }
-
-    // MARK: - Demo + manual + devices
-
-    private var demoButton: some View {
-        Menu {
-            Button("10 seconds") { runDemo(seconds: 10) }
-            Button("30 seconds") { runDemo(seconds: 30) }
-            Button("1 minute")   { runDemo(seconds: 60) }
-            Button("2 minutes")  { runDemo(seconds: 120) }
-            Button("5 minutes")  { runDemo(seconds: 300) }
-            Button("Stop", role: .destructive) { animator.cancel() }
-        } label: {
-            HStack {
-                Image(systemName: "play.fill")
-                Text("Demo Sunrise")
-                Spacer()
-                Image(systemName: "chevron.up.chevron.down").font(.caption2)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 10)
-            .background(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.4)))
-        }
-        .disabled(!hasConnectedPeer)
-    }
-
-    @ViewBuilder
-    private var manualControls: some View {
-        if hasConnectedPeer {
-            HStack(spacing: 10) {
-                Button {
-                    animator.cancel()
-                    ble.setPower(false)
-                } label: {
-                    Text("Off").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-
-                Button {
-                    ble.setPower(true)
-                    ble.setColor(r: 255, g: 240, b: 220)
-                } label: {
-                    Text("On").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-            }
-        }
-    }
-
-    private var devicesCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Strips").font(.headline)
-                Spacer()
-                Button {
-                    if ble.isScanning { ble.stopScan() } else { ble.startScan() }
-                } label: {
-                    Text(ble.isScanning ? "Stop" : "Scan")
-                }
-                .buttonStyle(.bordered)
-            }
-            if ble.peers.isEmpty {
-                Text("Tap Scan to find your LED strips.").font(.caption).foregroundStyle(.secondary)
-            }
-            ForEach(ble.peers, id: \.id) { peer in
-                deviceRow(peer)
-            }
-            NavigationLink {
-                PaletteEditorRoot(store: paletteStore)
-            } label: {
-                HStack {
-                    Text("Palettes").font(.subheadline)
-                    Spacer()
-                    Text("\(paletteStore.palettes.count)")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
-                }
-                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(soundEnabled ? Color.teal.opacity(0.35) : Color.gray.opacity(0.25))
+                )
+                .foregroundStyle(.white)
             }
             .buttonStyle(.plain)
+            .disabled(!soundEnabled)
         }
-        .padding()
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.10)))
     }
 
-    private func deviceRow(_ peer: StripPeer) -> some View {
-        Button {
-            ble.toggleSelection(peer)
-        } label: {
-            HStack {
-                Image(systemName: peer.isSelected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(peer.isSelected ? Color.accentColor : .secondary)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(peer.name).font(.subheadline)
-                    Text(peer.isConnected ? "connected" : "not connected")
+    // MARK: - Quick actions row (demo + on/off)
+
+    private var quickActionsRow: some View {
+        VStack(spacing: 10) {
+            Menu {
+                Button("10 seconds") { runDemo(seconds: 10) }
+                Button("30 seconds") { runDemo(seconds: 30) }
+                Button("1 minute")   { runDemo(seconds: 60) }
+                Button("2 minutes")  { runDemo(seconds: 120) }
+                Button("5 minutes")  { runDemo(seconds: 300) }
+                Button("Stop", role: .destructive) { animator.cancel() }
+            } label: {
+                HStack {
+                    Image(systemName: "play.circle.fill")
+                        .foregroundStyle(.orange)
+                    Text("Test Sunrise")
+                        .foregroundStyle(.white)
+                        .fontWeight(.medium)
+                    Spacer()
+                    Image(systemName: "chevron.up.chevron.down")
                         .font(.caption2)
-                        .foregroundStyle(peer.isConnected ? .green : .secondary)
+                        .foregroundStyle(.white.opacity(0.5))
                 }
-                Spacer()
-                Text("\(peer.rssi)").font(.caption2).foregroundStyle(.tertiary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.white.opacity(0.06))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                        )
+                )
             }
-            .padding(.vertical, 4)
-            .contentShape(Rectangle())
+            .disabled(!hasConnectedPeer)
+            .opacity(hasConnectedPeer ? 1.0 : 0.4)
+
+            if hasConnectedPeer {
+                HStack(spacing: 10) {
+                    Button {
+                        animator.cancel()
+                        ble.setPower(false)
+                    } label: {
+                        Label("Off", systemImage: "power")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.06)))
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        ble.setPower(true)
+                        ble.setColor(r: 255, g: 240, b: 220)
+                    } label: {
+                        Label("Warm White", systemImage: "sun.max.fill")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.06)))
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                }
+            } else {
+                Button {
+                    showingDevices = true
+                } label: {
+                    Label("Connect a strip", systemImage: "dot.radiowaves.left.and.right")
+                        .foregroundStyle(.white.opacity(0.8))
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+            }
         }
-        .buttonStyle(.plain)
+    }
+
+    // MARK: - Card builder + helpers
+
+    private func card(title: String, icon: String, accent: Color,
+                      trailing: () -> AnyView,
+                      @ViewBuilder content: () -> AnyView) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: icon).foregroundStyle(accent)
+                Text(title.uppercased())
+                    .font(.system(.caption, design: .rounded)).fontWeight(.bold).kerning(1.2)
+                    .foregroundStyle(Color.white.opacity(0.6))
+                Spacer()
+                trailing()
+            }
+            content()
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(.ultraThinMaterial.opacity(0.5))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+        )
+    }
+
+    private func emptyState(icon: String, text: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.title)
+                .foregroundStyle(Color.white.opacity(0.3))
+            Text(text)
+                .font(.footnote)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(Color.white.opacity(0.5))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 12)
+    }
+
+    private func settingRow(label: String, @ViewBuilder content: () -> AnyView) -> some View {
+        HStack {
+            Text(label).foregroundStyle(Color.white.opacity(0.85))
+            Spacer()
+            content()
+        }
     }
 
     // MARK: - Actions
 
-    private func fireSunrise(for profile: AlarmProfile) {
+    private func fireSunrise(for profile: AlarmProfile, duration: TimeInterval) {
         firingAlarmID = profile.id
         let palette = paletteStore.palettes.first(where: { $0.id == profile.paletteID })
             ?? paletteStore.activePalette
         animator.run(
             palette: palette,
-            durationSeconds: Double(profile.durationMinutes) * 60,
+            durationSeconds: duration,
             ble: ble
         )
     }
@@ -416,7 +532,6 @@ struct ContentView: View {
         )
     }
 
-    /// Keep the app awake whenever any alarm is enabled (so it can actually fire overnight).
     private func syncKeepAlive() {
         if alarm.hasEnabledAlarm {
             keepAlive.start()
@@ -444,22 +559,75 @@ struct ContentView: View {
         return days.sorted().map { labels[$0 - 1] }.joined(separator: " ")
     }
 
-    private func formatFireDate(_ d: Date) -> String {
-        let df = DateFormatter()
-        let cal = Calendar.current
-        if cal.isDateInToday(d) { df.dateFormat = "'today' h:mm a" }
-        else if cal.isDateInTomorrow(d) { df.dateFormat = "'tomorrow' h:mm a" }
-        else { df.dateFormat = "EEE h:mm a" }
-        return df.string(from: d)
+    private func formatCountdown(to date: Date) -> String {
+        let interval = date.timeIntervalSinceNow
+        if interval <= 0 { return "now" }
+        let total = Int(interval)
+        let days = total / 86400
+        let hours = (total % 86400) / 3600
+        let mins = (total % 3600) / 60
+        if days > 0 { return "in \(days)d \(hours)h" }
+        if hours > 0 { return "in \(hours)h \(mins)m" }
+        if mins > 0 { return "in \(mins)m" }
+        return "in <1m"
     }
 }
 
-// MARK: - Palettes list root (wraps PaletteEditorView for NavigationLink use)
+// MARK: - Devices sheet
 
-struct PaletteEditorRoot: View {
-    @Bindable var store: PaletteStore
+struct DevicesSheet: View {
+    @Bindable var ble: BluetoothManager
+    @Environment(\.dismiss) var dismiss
+
     var body: some View {
-        PaletteEditorView(store: store)
+        NavigationStack {
+            List {
+                Section {
+                    if ble.peers.isEmpty {
+                        Text("Tap Scan below to find your LED strips.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(ble.peers, id: \.id) { peer in
+                        Button {
+                            ble.toggleSelection(peer)
+                        } label: {
+                            HStack {
+                                Image(systemName: peer.isSelected ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(peer.isSelected ? Color.orange : Color.secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(peer.name).font(.body)
+                                    Text(peer.isConnected ? "Connected" : "Not connected")
+                                        .font(.caption)
+                                        .foregroundStyle(peer.isConnected ? .green : .secondary)
+                                }
+                                Spacer()
+                                Text("\(peer.rssi) dBm")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } header: {
+                    Text("BLE Devices")
+                } footer: {
+                    Text("Only devices selected here will be controlled by alarms, sunset, and manual buttons.")
+                }
+            }
+            .navigationTitle("Devices")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(ble.isScanning ? "Stop" : "Scan") {
+                        if ble.isScanning { ble.stopScan() } else { ble.startScan() }
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
     }
 }
 
@@ -522,7 +690,7 @@ struct PaletteEditorView: View {
             Text(p.name)
             Spacer()
             if store.activeID == p.id {
-                Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
+                Image(systemName: "checkmark").foregroundStyle(Color.orange)
             }
         }
         .contentShape(Rectangle())
