@@ -8,6 +8,16 @@ class SunriseAnimator {
     var isRunning: Bool = false
     var progress: Double = 0  // 0..1
     var currentColor: (r: UInt8, g: UInt8, b: UInt8) = (0, 0, 0)
+    var isReversed: Bool = false           // true = sunset
+    var totalDurationSeconds: Double = 0
+    var startedAt: Date = .distantPast
+
+    var elapsedSeconds: Double {
+        max(0, Date().timeIntervalSince(startedAt))
+    }
+    var remainingSeconds: Double {
+        max(0, totalDurationSeconds - elapsedSeconds)
+    }
 
     private var task: Task<Void, Never>? = nil
 
@@ -15,6 +25,9 @@ class SunriseAnimator {
         cancel()
         isRunning = true
         progress = 0
+        isReversed = reversed
+        totalDurationSeconds = durationSeconds
+        startedAt = Date()
         ble.setPower(true)
 
         let start = Date()

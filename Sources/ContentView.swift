@@ -125,30 +125,43 @@ struct ContentView: View {
 
     private var heroCard: some View {
         VStack(spacing: 10) {
-            ZStack {
+            ZStack(alignment: .bottom) {
                 RoundedRectangle(cornerRadius: 20)
                     .fill(Color(
                         red:   Double(animator.currentColor.r) / 255,
                         green: Double(animator.currentColor.g) / 255,
                         blue:  Double(animator.currentColor.b) / 255
                     ))
-                    .frame(height: 100)
+                    .frame(height: 110)
                     .overlay(
                         RoundedRectangle(cornerRadius: 20)
                             .stroke(Color.white.opacity(0.08), lineWidth: 1)
                     )
                 if animator.isRunning {
-                    VStack(spacing: 2) {
-                        Text("SUNRISE")
+                    VStack(spacing: 6) {
+                        Text(animator.isReversed ? "SUNSET" : "SUNRISE")
                             .font(.system(.caption2, design: .rounded))
                             .fontWeight(.heavy)
                             .kerning(1.5)
                             .foregroundStyle(.white.opacity(0.9))
-                        Text("\(Int(animator.progress * 100))%")
-                            .font(.system(.title, design: .rounded, weight: .bold))
+                        Text(formatMMSS(animator.remainingSeconds) + " left")
+                            .font(.system(.title2, design: .rounded, weight: .bold))
                             .foregroundStyle(.white)
                             .shadow(radius: 3)
+                            .monospacedDigit()
+                        // Left-to-right progress bar
+                        GeometryReader { geo in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.white.opacity(0.18))
+                                Capsule().fill(Color.white.opacity(0.85))
+                                    .frame(width: geo.size.width * animator.progress)
+                            }
+                        }
+                        .frame(height: 6)
+                        .padding(.horizontal, 20)
+                        .padding(.bottom, 12)
                     }
+                    .frame(maxHeight: .infinity, alignment: .center)
                 }
             }
             if let (nextAlarm, wakeAt) = alarm.soonestNextFire {
@@ -199,32 +212,37 @@ struct ContentView: View {
         Button {
             editingAlarm = a
         } label: {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(timeString(hour: a.hour, minute: a.minute))
-                        .font(.system(.largeTitle, design: .rounded, weight: .semibold))
-                        .foregroundStyle(a.isEnabled ? .white : Color.white.opacity(0.4))
-                        .monospacedDigit()
-                    HStack(spacing: 6) {
-                        Text(a.name)
-                            .font(.footnote)
-                            .foregroundStyle(a.isEnabled ? Color.white.opacity(0.7) : Color.white.opacity(0.3))
-                        Text("·")
-                            .foregroundStyle(Color.white.opacity(0.3))
-                        Text(daysString(a.repeatDays))
-                            .font(.footnote)
-                            .foregroundStyle(a.isEnabled ? Color.white.opacity(0.7) : Color.white.opacity(0.3))
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(timeString(hour: a.hour, minute: a.minute))
+                            .font(.system(.largeTitle, design: .rounded, weight: .semibold))
+                            .foregroundStyle(a.isEnabled ? .white : Color.white.opacity(0.4))
+                            .monospacedDigit()
+                        HStack(spacing: 6) {
+                            Text(a.name)
+                                .font(.footnote)
+                                .foregroundStyle(a.isEnabled ? Color.white.opacity(0.7) : Color.white.opacity(0.3))
+                            Text("·")
+                                .foregroundStyle(Color.white.opacity(0.3))
+                            Text(daysString(a.repeatDays))
+                                .font(.footnote)
+                                .foregroundStyle(a.isEnabled ? Color.white.opacity(0.7) : Color.white.opacity(0.3))
+                        }
                     }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { a.isEnabled },
+                        set: { on in
+                            alarm.toggle(id: a.id, on: on)
+                            syncKeepAlive()
+                        }))
+                        .labelsHidden()
+                        .tint(.orange)
                 }
-                Spacer()
-                Toggle("", isOn: Binding(
-                    get: { a.isEnabled },
-                    set: { on in
-                        alarm.toggle(id: a.id, on: on)
-                        syncKeepAlive()
-                    }))
-                    .labelsHidden()
-                    .tint(.orange)
+                // Palette gradient preview for this alarm
+                paletteGradientStrip(for: a)
+                    .opacity(a.isEnabled ? 1.0 : 0.4)
             }
             .padding(12)
             .background(
@@ -233,6 +251,22 @@ struct ContentView: View {
             )
         }
         .buttonStyle(.plain)
+    }
+
+    /// Show the alarm's palette as a smooth left-to-right gradient.
+    private func paletteGradientStrip(for a: AlarmProfile) -> some View {
+        let palette = paletteStore.palettes.first(where: { $0.id == a.paletteID })
+            ?? paletteStore.activePalette
+        let colors = palette.colors.map {
+            Color(red: Double($0.r)/255, green: Double($0.g)/255, blue: Double($0.b)/255)
+        }
+        return RoundedRectangle(cornerRadius: 4)
+            .fill(LinearGradient(colors: colors, startPoint: .leading, endPoint: .trailing))
+            .frame(height: 8)
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
+            )
     }
 
     @ViewBuilder
@@ -424,12 +458,11 @@ struct ContentView: View {
 
                     Button {
                         ble.setPower(true)
-                        ble.setColor(r: 255, g: 240, b: 220)
                     } label: {
-                        Label("Warm White", systemImage: "sun.max.fill")
+                        Label("On", systemImage: "power")
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 10)
-                            .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.06)))
+                            .background(RoundedRectangle(cornerRadius: 10).fill(Color.green.opacity(0.20)))
                             .foregroundStyle(.white)
                     }
                     .buttonStyle(.plain)
@@ -557,6 +590,13 @@ struct ContentView: View {
         if days == [1,7] { return "Weekends" }
         let labels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
         return days.sorted().map { labels[$0 - 1] }.joined(separator: " ")
+    }
+
+    private func formatMMSS(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded())
+        let m = total / 60
+        let s = total % 60
+        return String(format: "%d:%02d", m, s)
     }
 
     private func formatCountdown(to date: Date) -> String {
